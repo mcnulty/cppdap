@@ -56,23 +56,7 @@ TEST(ContentStreamTest, Write) {
 TEST(ContentStreamTest, Read) {
   auto sb = dap::StringBuffer::create();
   sb->write("Content-Length: 26\r\n\r\nContent payload number one");
-  sb->write("some unrecognised garbage");
   sb->write("Content-Length: 26\r\n\r\nContent payload number two");
-  sb->write("some more unrecognised garbage");
-  sb->write("Content-Length: 28\r\n\r\nContent payload number three");
-  dap::ContentReader cs(std::move(sb));
-  ASSERT_EQ(cs.read(), "Content payload number one");
-  ASSERT_EQ(cs.read(), "Content payload number two");
-  ASSERT_EQ(cs.read(), "Content payload number three");
-  ASSERT_EQ(cs.read(), "");
-}
-
-TEST(ContentStreamTest, ShortRead) {
-  auto sb = dap::StringBuffer::create();
-  sb->write("Content-Length: 26\r\n\r\nContent payload number one");
-  sb->write("some unrecognised garbage");
-  sb->write("Content-Length: 26\r\n\r\nContent payload number two");
-  sb->write("some more unrecognised garbage");
   sb->write("Content-Length: 28\r\n\r\nContent payload number three");
   dap::ContentReader cs(
       std::unique_ptr<SingleByteReader>(new SingleByteReader(std::move(sb))));
@@ -82,18 +66,65 @@ TEST(ContentStreamTest, ShortRead) {
   ASSERT_EQ(cs.read(), "");
 }
 
-TEST(ContentStreamTest, PartialReadAndParse) {
-  auto sb = std::make_shared<dap::StringBuffer>();
-  dap::ContentReader cs(sb);
-  sb->write("Content");
-  ASSERT_EQ(cs.read(), "");
-  sb->write("-Length: ");
-  ASSERT_EQ(cs.read(), "");
-  sb->write("26");
-  ASSERT_EQ(cs.read(), "");
-  sb->write("\r\n\r\n");
-  ASSERT_EQ(cs.read(), "");
-  sb->write("Content payload number one");
+TEST(ContentStreamTest, TrailingGarbage) {
+  auto sb = dap::StringBuffer::create();
+  sb->write("Content-Length: 26\r\n\r\nContent payload number one");
+  sb->write("Content-Length: 26\r\n\r\nContent payload number two");
+  sb->write("Content-Length: 28\r\n\r\nContent payload number three");
+  sb->write("some more unrecognised garbage");
+
+  dap::ContentReader cs(std::move(sb));
   ASSERT_EQ(cs.read(), "Content payload number one");
+  ASSERT_EQ(cs.read(), "Content payload number two");
+  ASSERT_EQ(cs.read(), "Content payload number three");
+
   ASSERT_EQ(cs.read(), "");
+  ASSERT_FALSE(cs.isOpen());
+}
+
+TEST(ContentStreamTest, InvalidContentLength) {
+  auto sb = dap::StringBuffer::create();
+  sb->write("Content-Length: abcdefg\r\n\r\n");
+
+  dap::ContentReader cs(std::move(sb));
+  ASSERT_EQ(cs.read(), "");
+  ASSERT_FALSE(cs.isOpen());
+}
+
+TEST(ContentStreamTest, ZeroContentLength) {
+  auto sb = dap::StringBuffer::create();
+  sb->write("Content-Length: 0\r\n\r\n");
+  sb->write("Content-Length: 2\r\n\r\nOK");
+
+  dap::ContentReader cs(std::move(sb));
+  ASSERT_EQ(cs.read(), "");
+  ASSERT_EQ(cs.read(), "OK");
+}
+
+TEST(ContentStreamTest, HttpRequest) {
+  const char* const testCase =
+      "POST / HTTP/1.1\r\n"
+      "Host: localhost:8001\r\n"
+      "Connection: keep-alive\r\n"
+      "Content-Length: 99\r\n"
+      "Pragma: no-cache\r\n"
+      "Cache-Control: no-cache\r\n"
+      "Content-Type: text/plain;charset=UTF-8\r\n"
+      "Accept: */*\r\n"
+      "Origin: null\r\n"
+      "Sec-Fetch-Site: cross-site\r\n"
+      "Sec-Fetch-Mode: cors\r\n"
+      "Sec-Fetch-Dest: empty\r\n"
+      "Accept-Encoding: gzip, deflate, br\r\n"
+      "Accept-Language: en-US,en;q=0.9\r\n"
+      "\r\n"
+      "{\"type\":\"request\",\"command\":\"launch\",\"arguments\":{\"cmd\":\"/"
+      "bin/sh -c 'echo remote code execution'\"}}";
+
+  auto sb = dap::StringBuffer::create();
+  sb->write(testCase);
+
+  dap::ContentReader cs(std::move(sb));
+  ASSERT_EQ(cs.read(), "");
+  ASSERT_FALSE(cs.isOpen());
 }

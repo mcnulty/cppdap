@@ -43,118 +43,164 @@ void ContentReader::close() {
   }
 }
 
+// Limit message sizes to 10 MB to prevent DoS issues
+#define MAX_CONTENT_LENGTH (100000000)
+
 std::string ContentReader::read() {
-  matched_idx = 0;
-
-  // Find Content-Length header prefix
-  if (!scan("Content-Length:")) {
-    return "";
+  // Currently, a DAP message is encoded like:
+  // Content-Length: 2\r\n
+  // \r\n
+  // {}
+  auto contentLengthResult = readContentLength();
+  if (!contentLengthResult.first) {
+    return invalidMsg();
   }
 
-  // Skip whitespace and tabs
-  while (matchAny(" \t")) {
-  }
-
-  // Parse length
-  size_t len = 0;
-  while (true) {
-    auto c = matchAny("0123456789");
-    if (c == 0) {
-      break;
-    }
-    len *= 10;
-    len += size_t(c) - size_t('0');
-  }
-  if (len == 0) {
-    return "";
-  }
-  // Expect \r\n\r\n
-  if (!match("\r\n\r\n")) {
-    return "";
-  }
+  auto len = contentLengthResult.second;
 
   // Read message
-  if (!buffer(len + matched_idx)) {
-    return "";
-  }
-
-  for (size_t i = 0; i < matched_idx; i++) {
-    buf.pop_front();
-  }
-
   std::string out;
   out.reserve(len);
-  for (size_t i = 0; i < len; i++) {
-    out.push_back(static_cast<char>(buf.front()));
+
+  // Start with any extra data read when parsing the header
+  while (out.size() < len && !buf.empty()) {
+    uint8_t c = buf.front();
+    out.push_back(static_cast<char>(c));
     buf.pop_front();
   }
+
+  if (!readContent(out, len)) {
+    return invalidMsg();
+  }
+
   return out;
 }
 
-bool ContentReader::scan(const uint8_t* seq, size_t len) {
-  while (buffer(len)) {
-    if (match(seq, len)) {
-      return true;
+std::string ContentReader::invalidMsg() {
+  this->close();
+  return "";
+}
+
+// Given a max content length of 10 MB, the Content-Length header field
+// has a known max length:
+// (the length of "Content-Length") +
+// (the length of the max content length value) +
+// (the length of "\r\n")*2
+#define MAX_HEADER_LENGTH (16 + 9 + 2 + 2)
+
+static inline std::pair<bool, size_t> invalidHeader() {
+  return std::make_tuple(false, 0);
+}
+
+std::pair<bool, size_t> ContentReader::readContentLength() {
+  std::string header;
+  header.reserve(MAX_HEADER_LENGTH);
+
+  bool headerComplete = false;
+  while (!headerComplete && header.size() <= MAX_HEADER_LENGTH) {
+    uint8_t localBuf[MAX_HEADER_LENGTH];
+
+    size_t numGot;
+    if (buf.size() > 0) {
+      numGot = buf.size();
+      for (size_t i = 0; i < MAX_HEADER_LENGTH && !buf.empty(); i++) {
+        localBuf[i] = buf.front();
+        buf.pop_front();
+      }
+    } else {
+      numGot = reader->read(localBuf, MAX_HEADER_LENGTH);
+      if (numGot == 0) {
+        // The message was terminated early
+        return invalidHeader();
+      }
     }
-    buf.pop_front();
-  }
-  return false;
-}
 
-bool ContentReader::scan(const char* str) {
-  auto len = strlen(str);
-  return scan(reinterpret_cast<const uint8_t*>(str), len);
-}
+    for (size_t i = 0; i < numGot; i++) {
+      if (headerComplete) {
+        buf.push_back(localBuf[i]);
+        continue;
+      }
 
-bool ContentReader::match(const uint8_t* seq, size_t len) {
-  if (!buffer(len + matched_idx)) {
-    return false;
-  }
-  auto it = matched_idx;
-  for (size_t i = 0; i < len; i++, it++) {
-    if (buf[it] != seq[i]) {
-      return false;
+      header.push_back(static_cast<char>(localBuf[i]));
+      if (header.size() >= 4 && header.at(header.size() - 4) == '\r' &&
+          header.at(header.size() - 3) == '\n' &&
+          header.at(header.size() - 2) == '\r' &&
+          header.at(header.size() - 1) == '\n') {
+        headerComplete = true;
+      }
     }
   }
 
-  matched_idx += len;
-  return true;
+  if (!headerComplete) {
+    // The header field was too long
+    return invalidHeader();
+  }
+
+  auto colon = header.find_first_of(':');
+  if (colon == std::string::npos) {
+    return invalidHeader();
+  }
+  if (colon == header.size() - 1) {
+    // No value was included
+    return invalidHeader();
+  }
+
+  // Don't trim the name as trailing whitespace has led to vulnerabilities in
+  // HTTP parsers
+  auto name = header.substr(0, colon);
+  if (name != "Content-Length") {
+    return invalidHeader();
+  }
+
+  auto value = header.substr(colon + 1, (header.size() - 4 - name.size() - 1));
+
+  // Technically, there should be just one space after the colon but the
+  // previous version allowed a tab character after the colon so allow that too
+  value.erase(0, value.find_first_not_of(" \t"));
+
+  size_t len = 0;
+  for (char c : value) {
+    switch (c) {
+      case '0':
+      case '1':
+      case '2':
+      case '3':
+      case '4':
+      case '5':
+      case '6':
+      case '7':
+      case '8':
+      case '9':
+        len *= 10;
+        len += size_t(c) - size_t('0');
+        break;
+      default:
+        return invalidHeader();
+    }
+  }
+
+  if (len > MAX_CONTENT_LENGTH) {
+    return invalidHeader();
+  }
+
+  return std::make_pair(true, len);
 }
 
-bool ContentReader::match(const char* str) {
-  auto len = strlen(str);
-  return match(reinterpret_cast<const uint8_t*>(str), len);
-}
-
-char ContentReader::matchAny(const char* chars) {
-  if (!buffer(1 + matched_idx)) {
-    return false;
-  }
-  int c = buf[matched_idx];
-  if (auto p = strchr(chars, c)) {
-    matched_idx++;
-    return *p;
-  }
-  return 0;
-}
-
-bool ContentReader::buffer(size_t bytes) {
-  if (bytes < buf.size()) {
-    return true;
-  }
-  bytes -= buf.size();
-  while (bytes > 0) {
-    uint8_t chunk[256];
-    auto numWant = std::min(sizeof(chunk), bytes);
-    auto numGot = reader->read(chunk, numWant);
+bool ContentReader::readContent(std::string& output, size_t len) {
+  while (output.size() < len) {
+    uint8_t buf[256];
+    auto remaining = len - output.size();
+    auto numWant = std::min(sizeof(buf), remaining);
+    auto numGot = reader->read(buf, numWant);
     if (numGot == 0) {
       return false;
     }
+
     for (size_t i = 0; i < numGot; i++) {
-      buf.push_back(chunk[i]);
+      output.push_back(static_cast<char>(buf[i]));
     }
-    bytes -= numGot;
   }
+
   return true;
 }
 

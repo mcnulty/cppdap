@@ -38,16 +38,12 @@ class ContentReader {
   std::string read();
 
  private:
-  bool scan(const uint8_t* seq, size_t len);
-  bool scan(const char* str);
-  bool match(const uint8_t* seq, size_t len);
-  bool match(const char* str);
-  char matchAny(const char* chars);
-  bool buffer(size_t bytes);
+  std::pair<bool, size_t> readContentLength();
+  bool readContent(std::string& output, size_t len);
+  std::string invalidMsg();
 
-  std::shared_ptr<Reader> reader;
   std::deque<uint8_t> buf;
-  uint32_t matched_idx = 0;
+  std::shared_ptr<Reader> reader;
 };
 
 class ContentWriter {
